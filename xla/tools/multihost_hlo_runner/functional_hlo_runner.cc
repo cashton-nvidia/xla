@@ -88,6 +88,10 @@ limitations under the License.
 #include "tsl/profiler/protobuf/profiler_options.pb.h"
 #include "tsl/profiler/protobuf/xplane.pb.h"
 
+#if GOOGLE_CUDA
+#include "xla/backends/profiler/gpu/cupti_tracer.h"
+#endif
+
 namespace xla {
 namespace FunctionalHloRunner {
 namespace {
@@ -566,13 +570,16 @@ absl::StatusOr<PerDeviceLiteralVecType> RunInternal(
   std::vector<std::vector<std::unique_ptr<PjRtBuffer>>> device_buffers;
   std::vector<std::vector<PjRtBuffer*>> argument_ptrs;
 
+  // Local copies that may be adjusted by range profiling pass count query.
+  size_t num_repeats = running_options.num_repeats;
+  size_t num_repeats_with_profiler = running_options.num_repeats_with_profiler;
+
   bool has_active_profiler_session = false;
-  for (int repeat = 0; repeat < running_options.num_repeats; ++repeat) {
-    const bool is_last_repeat = (repeat == running_options.num_repeats - 1);
-    const bool profile_current_repeat =
+  for (size_t repeat = 0; repeat < num_repeats; ++repeat) {
+    bool is_last_repeat = (repeat == num_repeats - 1);
+    bool profile_current_repeat =
         (running_options.profiler != nullptr) &&
-        (repeat >= running_options.num_repeats -
-                       running_options.num_repeats_with_profiler);
+        (repeat >= num_repeats - num_repeats_with_profiler);
 
     VLOG(1) << "FunctionalHloRunner: ExecuteOnDevices started (repeat = "
             << repeat << ").";
@@ -597,13 +604,53 @@ absl::StatusOr<PerDeviceLiteralVecType> RunInternal(
       if (profile_current_repeat && !has_active_profiler_session) {
         running_options.profiler->CreateSession();
         has_active_profiler_session = true;
+
+        // Adjust the loop bounds if the profiler requires replay passes.
+        int passes = running_options.profiler->GetNumRequiredPasses();
+        LOG(INFO) << "Range profiling: GetNumRequiredPasses() returned "
+                  << passes;
+        if (passes > 0) {
+          size_t warmup = running_options.range_profiling_warmup_passes;
+          // Account for current position in the loop: we need enough
+          // remaining iterations from *here* for warmup + profiling passes.
+          size_t needed = repeat + warmup + passes;
+          if (needed > num_repeats) {
+            LOG(INFO) << "Range profiling: adjusting num_repeats from "
+                      << num_repeats << " to " << needed
+                      << " (repeat=" << repeat << ", " << warmup
+                      << " warmup + " << passes << " profiling passes)";
+            num_repeats = needed;
+          }
+          num_repeats_with_profiler = passes;
+          // Recompute loop control after adjustment.
+          is_last_repeat = (repeat == num_repeats - 1);
+          profile_current_repeat =
+              (repeat >= num_repeats - num_repeats_with_profiler);
+        }
       }
+
+      // Range profiling hooks: begin pass before execute, push/pop range
+      // around the GPU work.
+      if (running_options.begin_pass_hook) {
+        TF_RETURN_IF_ERROR(running_options.begin_pass_hook());
+      }
+      if (running_options.push_range_hook) {
+        TF_RETURN_IF_ERROR(running_options.push_range_hook());
+      }
+
       futures->clear();
       TF_ASSIGN_OR_RETURN(
           output_buffers,
           executable->Execute(argument_ptrs, execute_options, futures));
       for (auto& future : *futures) {
         TF_RETURN_IF_ERROR(future.Await());
+      }
+
+      if (running_options.pop_range_hook) {
+        TF_RETURN_IF_ERROR(running_options.pop_range_hook());
+      }
+      if (running_options.end_pass_hook) {
+        TF_RETURN_IF_ERROR(running_options.end_pass_hook());
       }
 
       const bool upload_active_profiler_session =
@@ -1550,21 +1597,47 @@ std::string AbslUnparseFlag(ModuleOutputMode output_mode) {
 }  // namespace FunctionalHloRunner
 
 HLORunnerProfiler::HLORunnerProfiler(absl::string_view dump_path,
-                                     bool keep_xspace)
-    : dump_path_(dump_path), keep_xspace_(keep_xspace) {}
+                                     bool keep_xspace,
+                                     absl::string_view range_profiling_metrics)
+    : dump_path_(dump_path),
+      keep_xspace_(keep_xspace),
+      range_profiling_metrics_(range_profiling_metrics) {}
 
 absl::StatusOr<std::unique_ptr<HLORunnerProfiler>> HLORunnerProfiler::Create(
-    absl::string_view dump_path, bool keep_xspace) {
+    absl::string_view dump_path, bool keep_xspace,
+    absl::string_view range_profiling_metrics) {
   if (dump_path.empty()) {
     return absl::InvalidArgumentError(
         "Please provide a valid dump path to save XSpace results to disk.");
   }
-  return std::make_unique<HLORunnerProfiler>(dump_path, keep_xspace);
+  return std::make_unique<HLORunnerProfiler>(dump_path, keep_xspace,
+                                             range_profiling_metrics);
 }
 
 void HLORunnerProfiler::CreateSession() {
   auto options = tsl::ProfilerSession::DefaultOptions();
+  if (!range_profiling_metrics_.empty()) {
+    tensorflow::ProfileOptions::AdvancedConfigValue metrics_value;
+    metrics_value.set_string_value(range_profiling_metrics_);
+    (*options.mutable_advanced_configuration())
+        ["gpu_range_profiling_counters"] = metrics_value;
+    // The multi-hlo-runner controls the repeat loop, so multi-pass is safe.
+    tensorflow::ProfileOptions::AdvancedConfigValue multipass_value;
+    multipass_value.set_bool_value(true);
+    (*options.mutable_advanced_configuration())
+        ["gpu_range_profiling_allow_multipass"] = multipass_value;
+  }
   session_ = tsl::ProfilerSession::Create(options);
+}
+
+int HLORunnerProfiler::GetNumRequiredPasses() const {
+#if GOOGLE_CUDA
+  auto* tracer = profiler::CuptiTracer::GetCuptiTracerSingleton();
+  if (tracer->IsRangeProfilingEnabled()) {
+    return tracer->NumRangeProfilingPasses();
+  }
+#endif
+  return 0;
 }
 
 void HLORunnerProfiler::UploadSession() {
