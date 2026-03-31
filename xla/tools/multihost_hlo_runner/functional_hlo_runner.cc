@@ -570,16 +570,27 @@ absl::StatusOr<PerDeviceLiteralVecType> RunInternal(
   std::vector<std::vector<std::unique_ptr<PjRtBuffer>>> device_buffers;
   std::vector<std::vector<PjRtBuffer*>> argument_ptrs;
 
-  // Local copies that may be adjusted by range profiling pass count query.
+  // Local copy that may be extended by range profiling pass count query.
   size_t num_repeats = running_options.num_repeats;
-  size_t num_repeats_with_profiler = running_options.num_repeats_with_profiler;
-
+  const bool has_range_hooks = (running_options.begin_pass_hook != nullptr);
   bool has_active_profiler_session = false;
+
   for (size_t repeat = 0; repeat < num_repeats; ++repeat) {
     bool is_last_repeat = (repeat == num_repeats - 1);
-    bool profile_current_repeat =
-        (running_options.profiler != nullptr) &&
-        (repeat >= num_repeats - num_repeats_with_profiler);
+
+    // Determine if this repeat should be profiled.  For range profiling,
+    // all original repeats are warmup; profiling passes are appended after
+    // the session is created.  For non-range profiling, the last
+    // num_repeats_with_profiler repeats are profiled.
+    bool profile_current_repeat;
+    if (has_range_hooks) {
+      profile_current_repeat = has_active_profiler_session;
+    } else {
+      profile_current_repeat =
+          (running_options.profiler != nullptr) &&
+          (repeat >=
+           num_repeats - running_options.num_repeats_with_profiler);
+    }
 
     VLOG(1) << "FunctionalHloRunner: ExecuteOnDevices started (repeat = "
             << repeat << ").";
@@ -601,41 +612,11 @@ absl::StatusOr<PerDeviceLiteralVecType> RunInternal(
         execute_options.execution_profile->set_warmup_run_executed(repeat > 0);
       }
 
-      if (profile_current_repeat && !has_active_profiler_session) {
+      // Non-range profiling: create session at start of profiling window.
+      if (!has_range_hooks && profile_current_repeat &&
+          !has_active_profiler_session) {
         running_options.profiler->CreateSession();
         has_active_profiler_session = true;
-
-        // Adjust the loop bounds if the profiler requires replay passes.
-        int passes = running_options.profiler->GetNumRequiredPasses();
-        LOG(INFO) << "Range profiling: GetNumRequiredPasses() returned "
-                  << passes;
-        if (passes > 0) {
-          size_t warmup = running_options.range_profiling_warmup_passes;
-          // Account for current position in the loop: we need enough
-          // remaining iterations from *here* for warmup + profiling passes.
-          size_t needed = repeat + warmup + passes;
-          if (needed > num_repeats) {
-            LOG(INFO) << "Range profiling: adjusting num_repeats from "
-                      << num_repeats << " to " << needed
-                      << " (repeat=" << repeat << ", " << warmup
-                      << " warmup + " << passes << " profiling passes)";
-            num_repeats = needed;
-          }
-          num_repeats_with_profiler = passes;
-          // Recompute loop control after adjustment.
-          is_last_repeat = (repeat == num_repeats - 1);
-          profile_current_repeat =
-              (repeat >= num_repeats - num_repeats_with_profiler);
-        }
-      }
-
-      // Range profiling hooks: begin pass before execute, push/pop range
-      // around the GPU work.
-      if (running_options.begin_pass_hook) {
-        TF_RETURN_IF_ERROR(running_options.begin_pass_hook());
-      }
-      if (running_options.push_range_hook) {
-        TF_RETURN_IF_ERROR(running_options.push_range_hook());
       }
 
       futures->clear();
@@ -646,13 +627,52 @@ absl::StatusOr<PerDeviceLiteralVecType> RunInternal(
         TF_RETURN_IF_ERROR(future.Await());
       }
 
-      if (running_options.pop_range_hook) {
-        TF_RETURN_IF_ERROR(running_options.pop_range_hook());
-      }
-      if (running_options.end_pass_hook) {
-        TF_RETURN_IF_ERROR(running_options.end_pass_hook());
+      // Range profiling: after all warmup repeats complete, create the
+      // profiler session and extend the loop for the required number of
+      // replay passes.  Enable() starts the first pass (BeginPass +
+      // PushRange); the next iteration executes inside that range.
+      bool just_created_range_session = false;
+      if (has_range_hooks && is_last_repeat && !has_active_profiler_session &&
+          running_options.profiler != nullptr) {
+        LOG(INFO) << "Range profiling: creating session";
+        running_options.profiler->CreateSession();
+        has_active_profiler_session = true;
+        just_created_range_session = true;
+        int passes = running_options.profiler->GetNumRequiredPasses();
+        LOG(INFO) << "Range profiling: " << passes << " pass(es) required";
+        if (passes < 1) passes = 1;
+        num_repeats += passes;
+        is_last_repeat = false;
       }
 
+      // Range profiling: transition between passes.  After each profiling
+      // execute (except the last), end the current pass and begin the next.
+      // The first pass was started by Enable(); the last is ended by
+      // Disable() during UploadSession.
+      if (has_range_hooks && has_active_profiler_session &&
+          !just_created_range_session) {
+        is_last_repeat = (repeat == num_repeats - 1);
+        if (!is_last_repeat) {
+          LOG(INFO) << "Range profiling: transitioning after pass " << repeat;
+          if (running_options.pop_range_hook) {
+            TF_RETURN_IF_ERROR(running_options.pop_range_hook());
+          }
+          if (running_options.end_pass_hook) {
+            TF_RETURN_IF_ERROR(running_options.end_pass_hook());
+          }
+          if (running_options.begin_pass_hook) {
+            TF_RETURN_IF_ERROR(running_options.begin_pass_hook());
+          }
+          if (running_options.push_range_hook) {
+            TF_RETURN_IF_ERROR(running_options.push_range_hook());
+          }
+        }
+      }
+
+      // Upload profiler session on last repeat (or between repeats if
+      // recreating sessions).  For range profiling, Disable() handles the
+      // final PopRange + EndPass.
+      is_last_repeat = (repeat == num_repeats - 1);
       const bool upload_active_profiler_session =
           running_options.recreate_profiler_session_between_repeats ||
           is_last_repeat;

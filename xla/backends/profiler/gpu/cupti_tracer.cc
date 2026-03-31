@@ -1213,6 +1213,9 @@ absl::Status CuptiTracer::Enable(
           "use the multi-hlo-runner which supports multi-pass profiling."));
     }
     range_profiling_enabled_ = true;
+    TF_RETURN_IF_ERROR(BeginRangePass());
+    TF_RETURN_IF_ERROR(PushProfilingRange(
+          option_->range_profiler_options.range_name));
   }
 
   return status;
@@ -1221,6 +1224,12 @@ absl::Status CuptiTracer::Enable(
 void CuptiTracer::Disable() {
   // Flush and tear down range profiling before Cupti Tracer is disabled.
   if (range_profiling_enabled_) {
+    if (absl::Status status = PopProfilingRange(); !status.ok()) {
+      LOG(WARNING) << "Failed to pop the range profiler range: " << status;
+    }
+    if (absl::Status status = EndRangePass(); !status.ok()) {
+      LOG(WARNING) << "Failed to end the range profiler pass: " << status;
+    }
     if (absl::Status status = cupti_range_profiler_->FlushAndDecode();
         !status.ok()) {
       LOG(WARNING) << "Failed to flush range profiler: " << status;

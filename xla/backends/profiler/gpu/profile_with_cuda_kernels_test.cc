@@ -318,11 +318,10 @@ TEST(ProfilerCudaKernelSanityTest, SimpleAddSubWithRangeProfiling) {
   range_results_num_ranges = 0;
   range_results_num_metrics = 0;
 
-  // Run the workload once per pass.
+  // Enable() started the first pass (BeginPass + PushRange).
+  // Run the workload once per pass, with inter-pass transitions in between.
   for (int pass = 0; pass < num_passes; ++pass) {
     LOG(INFO) << "Starting pass " << pass;
-    ASSERT_TRUE(tracer.BeginRangePass().ok());
-    ASSERT_TRUE(tracer.PushProfilingRange("test_range").ok());
 
     std::vector<double> vec = SimpleAddSubWithProfiler(kNumElements);
 
@@ -330,11 +329,16 @@ TEST(ProfilerCudaKernelSanityTest, SimpleAddSubWithRangeProfiling) {
     EXPECT_EQ(vec.size(), kNumElements);
     EXPECT_THAT(vec, Each(DistanceFrom(0, Lt(0.001))));
 
-    ASSERT_TRUE(tracer.PopProfilingRange().ok());
-    ASSERT_TRUE(tracer.EndRangePass().ok());
+    // Transition between passes (not after the last — Disable handles that).
+    if (pass < num_passes - 1) {
+      ASSERT_TRUE(tracer.PopProfilingRange().ok());
+      ASSERT_TRUE(tracer.EndRangePass().ok());
+      ASSERT_TRUE(tracer.BeginRangePass().ok());
+      ASSERT_TRUE(tracer.PushProfilingRange("test_range").ok());
+    }
   }
 
-  // Disable triggers FlushAndDecode + process_results callback.
+  // Disable() ends the last pass (PopRange + EndPass) then FlushAndDecode.
   tracer.Disable();
 
   // Validate that results were delivered.
@@ -428,19 +432,25 @@ TEST(ProfilerCudaKernelSanityTest, SimpleAddSubWithMultiPassRangeProfiling) {
   range_results_num_metrics = 0;
   range_results_fp64_sum = 0;
 
+  // Enable() started the first pass (BeginPass + PushRange).
+  // Run the workload once per pass, with inter-pass transitions in between.
   for (int pass = 0; pass < num_passes; ++pass) {
     LOG(INFO) << "Starting pass " << pass << " of " << num_passes;
-    ASSERT_TRUE(tracer.BeginRangePass().ok());
-    ASSERT_TRUE(tracer.PushProfilingRange("test_multipass").ok());
 
     std::vector<double> vec = SimpleAddSubWithProfiler(kNumElements);
     EXPECT_EQ(vec.size(), kNumElements);
     EXPECT_THAT(vec, Each(DistanceFrom(0, Lt(0.001))));
 
-    ASSERT_TRUE(tracer.PopProfilingRange().ok());
-    ASSERT_TRUE(tracer.EndRangePass().ok());
+    // Transition between passes (not after the last — Disable handles that).
+    if (pass < num_passes - 1) {
+      ASSERT_TRUE(tracer.PopProfilingRange().ok());
+      ASSERT_TRUE(tracer.EndRangePass().ok());
+      ASSERT_TRUE(tracer.BeginRangePass().ok());
+      ASSERT_TRUE(tracer.PushProfilingRange("test_multipass").ok());
+    }
   }
 
+  // Disable() ends the last pass (PopRange + EndPass) then FlushAndDecode.
   tracer.Disable();
 
   EXPECT_TRUE(range_results_received);
