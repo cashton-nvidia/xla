@@ -29,6 +29,7 @@ limitations under the License.
 #include "xla/autotuning.pb.h"
 #include "xla/backends/autotuner/autotuner_cache.pb.h"
 #include "xla/backends/autotuner/autotuner_cache_interface.h"
+#include "xla/backends/autotuner/backends.pb.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/parser/hlo_parser.h"
 #include "xla/literal_util.h"
@@ -45,6 +46,7 @@ namespace gpu {
 namespace {
 
 using Config = ::xla::AutotunerCacheInterface::Config;
+using autotuner::Backend;
 using ::testing::Eq;
 using ::testing::Optional;
 
@@ -91,35 +93,35 @@ class LegacyCacheTest : public ::testing::Test {
 
   Config CreateDummyTritonConfig() {
     Config config;
-    config.codegen_backend_name = "TRITON";
+    config.codegen_backend = Backend::TRITON;
     config.backend_config.PackFrom(AutotuneResult::TritonGemmKey());
     return config;
   }
 
   Config CreateDummyCublasLtConfig() {
     Config config;
-    config.codegen_backend_name = "CUBLASLT";
+    config.codegen_backend = Backend::CUBLASLT;
     config.backend_config.PackFrom(AutotuneResult::GemmKey());
     return config;
   }
 
   Config CreateDummyCublasLtFissionConfig() {
     Config config;
-    config.codegen_backend_name = "CUBLASLT_FISSION";
+    config.codegen_backend = Backend::CUBLASLT_FISSION;
     config.backend_config.PackFrom(AutotuneResult::GemmKey());
     return config;
   }
 
   Config CreateDummyCudnnConfig() {
     Config config;
-    config.codegen_backend_name = "CUDNN";
+    config.codegen_backend = Backend::CUDNN;
     config.backend_config.PackFrom(stream_executor::dnn::AlgorithmProto());
     return config;
   }
 
   Config CreateDummyCustomKernelFissionConfig() {
     Config config;
-    config.codegen_backend_name = "CUSTOM_KERNEL_FISSION";
+    config.codegen_backend = Backend::CUSTOM_KERNEL_FISSION;
     config.backend_config.PackFrom(AutotuneResult::CustomKernelFusionKey());
     return config;
   }
@@ -127,7 +129,7 @@ class LegacyCacheTest : public ::testing::Test {
   Config CreateDummyBackendConfig() {
     using DummyOtherConfig = AutotuneResult::CustomKernelFusionKey;
     Config config;
-    config.codegen_backend_name = "NATIVE_EMITTER";
+    config.codegen_backend = Backend::CUSTOM_KERNEL_FISSION;
     config.backend_config.PackFrom(DummyOtherConfig());
     return config;
   }
@@ -136,11 +138,10 @@ class LegacyCacheTest : public ::testing::Test {
 // Matcher for Config.
 MATCHER_P(ConfigEq, expected_config, "") {
   const Config& actual_config = arg;
-  if (actual_config.codegen_backend_name !=
-      expected_config.codegen_backend_name) {
+  if (actual_config.codegen_backend != expected_config.codegen_backend) {
     *result_listener << "codegen_backend mismatch: expected "
-                     << expected_config.codegen_backend_name << ", got "
-                     << actual_config.codegen_backend_name;
+                     << expected_config.codegen_backend << ", got "
+                     << actual_config.codegen_backend;
     return false;
   }
   // Compare backend_config (google::protobuf::Any)
@@ -308,6 +309,38 @@ TEST_F(LegacyCacheTest, SerializeAndDeserialize) {
   TF_ASSERT_OK(cache.Deserialize(serialized_cache));
   EXPECT_THAT(cache.Lookup(instr_1.get()), Optional(ConfigEq(orig_config)));
   EXPECT_THAT(cache.Lookup(instr_2.get()), Optional(ConfigEq(another_config)));
+}
+
+TEST_F(LegacyCacheTest, CacheStats) {
+  auto cache = LegacyCache(test_dir_, mode_, device_desc_);
+  auto instr1 = CreateDummyInstr("hlo_stats1");
+  auto instr2 = CreateDummyInstr("hlo_stats2");
+  Config config = CreateDummyTritonConfig();
+
+  // Initial stats: 0 hits, 0 misses.
+  EXPECT_EQ(cache.GetCacheStats().hits, 0);
+  EXPECT_EQ(cache.GetCacheStats().misses, 0);
+
+  // Lookup miss.
+  EXPECT_THAT(cache.Lookup(instr1.get()), Eq(std::nullopt));
+  EXPECT_EQ(cache.GetCacheStats().hits, 0);
+  EXPECT_EQ(cache.GetCacheStats().misses, 1);
+
+  // Insert and lookup hit.
+  TF_ASSERT_OK(cache.Insert(instr1.get(), config));
+  EXPECT_THAT(cache.Lookup(instr1.get()), Optional(ConfigEq(config)));
+  EXPECT_EQ(cache.GetCacheStats().hits, 1);
+  EXPECT_EQ(cache.GetCacheStats().misses, 1);
+
+  // Lookup same instruction again, hit.
+  EXPECT_THAT(cache.Lookup(instr1.get()), Optional(ConfigEq(config)));
+  EXPECT_EQ(cache.GetCacheStats().hits, 2);
+  EXPECT_EQ(cache.GetCacheStats().misses, 1);
+
+  // Lookup another instruction, miss.
+  EXPECT_THAT(cache.Lookup(instr2.get()), Eq(std::nullopt));
+  EXPECT_EQ(cache.GetCacheStats().hits, 2);
+  EXPECT_EQ(cache.GetCacheStats().misses, 2);
 }
 
 }  // namespace

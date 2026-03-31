@@ -21,6 +21,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include "absl/base/log_severity.h"
 #include "absl/log/scoped_mock_log.h"
+#include "absl/strings/ascii.h"
 #include "absl/strings/string_view.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringRef.h"
@@ -58,18 +59,31 @@ TEST_F(SymbolicMapSerializationTest,
        PrintSymbolicExprWithDifferentNumDimensions) {
   SymbolicExpr expr = v0 * 2 + v1;
 
-  EXPECT_THAT(expr.ToString(), MatchIndexingString("((v0 * 2) + v1)"));
+  EXPECT_THAT(expr.ToString(), MatchIndexingString("v0 * 2 + v1"));
   // Only symbols
-  EXPECT_THAT(expr.ToString(0), MatchIndexingString("((s0 * 2) + s1)"));
+  EXPECT_THAT(expr.ToString(0), MatchIndexingString("s0 * 2 + s1"));
   // One dimension and one symbol
-  EXPECT_THAT(expr.ToString(1), MatchIndexingString("((d0 * 2) + s0)"));
+  EXPECT_THAT(expr.ToString(1), MatchIndexingString("d0 * 2 + s0"));
   // Only dimensions
-  EXPECT_THAT(expr.ToString(2), MatchIndexingString("((d0 * 2) + d1)"));
+  EXPECT_THAT(expr.ToString(2), MatchIndexingString("d0 * 2 + d1"));
+}
+
+TEST_F(SymbolicMapSerializationTest, PrintSymbolicExprOperatorPrecedence) {
+  // Multiplication and modulo have higher precedence than addition.
+  EXPECT_THAT((v0 + (v1 * 2)).ToString(), MatchIndexingString("v0 + v1 * 2"));
+  EXPECT_THAT(((v0 % 2) * 4).ToString(), MatchIndexingString("v0 mod 2 * 4"));
+
+  // Pretty print negative terms.
+  EXPECT_THAT((v0 + (-1)).ToString(), MatchIndexingString("v0 - 1"));
+  EXPECT_THAT((v0 + (-2 * v1)).ToString(), MatchIndexingString("v0 - v1 * 2"));
+
+  // No parentheses should be added for addition/subtraction.
+  EXPECT_THAT(((v0 + v1) - v2).ToString(), MatchIndexingString("v0 + v1 - v2"));
 }
 
 TEST_F(SymbolicMapSerializationTest, ParseSymbolicExprAndPrint) {
   const std::string kStringContainingAllOperators =
-      "(((((v0 + 42) * max(min(v1, 2), 0)) floordiv 2) ceildiv 2) mod 5)";
+      "(v0 + 42) * max(min(v1, 2), 0) floordiv 2 ceildiv 2 mod 5";
   SymbolicExpr parsed_expr =
       ParseSymbolicExpr(kStringContainingAllOperators, &ctx);
   ASSERT_NE(parsed_expr, nullptr);
@@ -96,6 +110,19 @@ TEST_F(SymbolicMapSerializationTest, ParseSymbolicExprAndPrint_Invalid) {
   EXPECT_CALL(log, Log(absl::LogSeverity::kError, testing::_,
                        "Failed to parse expression at: \"foo(3, 4)\""));
   EXPECT_EQ(ParseSymbolicExpr("foo(3, 4)", &ctx), SymbolicExpr());
+}
+
+TEST_F(SymbolicMapSerializationTest, ParseSymbolicExprAndAdvance_Invalid) {
+  absl::ScopedMockLog log(absl::MockLogDefault::kDisallowUnexpected);
+  log.StartCapturingLogs();
+
+  // Invalid: Incomplete expression
+  EXPECT_CALL(log, Log(absl::LogSeverity::kError, _,
+                       "Unexpected end of expression at: \"\""));
+  absl::string_view expr_str = "1 + ";
+  EXPECT_EQ(ParseSymbolicExprAndAdvance(&expr_str, &ctx), SymbolicExpr());
+  // The expression string is not consumed because parsing failed.
+  EXPECT_EQ(expr_str, "1 + ");
 }
 
 TEST_F(SymbolicMapSerializationTest, ParseSymbolicExprWithVariableMap) {
@@ -198,6 +225,39 @@ TEST_F(SymbolicMapSerializationTest, ParseSymbolicMap_Invalid) {
                        HasSubstr("Failed to parse expression list")));
   EXPECT_EQ(ParseSymbolicMap("(d0) -> d0", &ctx), SymbolicMap());
   ::testing::Mock::VerifyAndClearExpectations(&log);
+}
+
+TEST_F(SymbolicMapSerializationTest, ParseSymbolicMapAndAdvance_ConsumesAll) {
+  absl::string_view map_str = "(d0) -> (d0)";
+  SymbolicMap map = ParseSymbolicMapAndAdvance(&map_str, &ctx);
+  EXPECT_EQ(map.ToString(), "(d0)[] -> (d0)");
+  EXPECT_EQ(map_str, "");
+}
+
+TEST_F(SymbolicMapSerializationTest, ParseSymbolicMapAndAdvance_WithSuffix) {
+  absl::string_view map_str = "(d0) -> (d0) domain: d0 in [0, 1]";
+  SymbolicMap map = ParseSymbolicMapAndAdvance(&map_str, &ctx);
+  EXPECT_EQ(map.ToString(), "(d0)[] -> (d0)");
+  EXPECT_EQ(absl::StripLeadingAsciiWhitespace(map_str), "domain: d0 in [0, 1]");
+}
+
+TEST_F(SymbolicMapSerializationTest, ParseSymbolicMapAndAdvance_Invalid) {
+  absl::ScopedMockLog log(absl::MockLogDefault::kDisallowUnexpected);
+  log.StartCapturingLogs();
+
+  // Invalid: Empty string
+  EXPECT_CALL(log, Log(absl::LogSeverity::kError, _,
+                       HasSubstr("Failed to parse dimension list")));
+  absl::string_view map_str = "";
+  EXPECT_EQ(ParseSymbolicMapAndAdvance(&map_str, &ctx), SymbolicMap());
+
+  // Invalid: Malformed map string
+  EXPECT_CALL(log, Log(absl::LogSeverity::kError, _,
+                       HasSubstr("Failed to parse expression list")));
+  map_str = "(d0) -> d0";
+  EXPECT_EQ(ParseSymbolicMapAndAdvance(&map_str, &ctx), SymbolicMap());
+  // The map string is not consumed because parsing failed.
+  EXPECT_EQ(map_str, "(d0) -> d0");
 }
 
 }  // namespace

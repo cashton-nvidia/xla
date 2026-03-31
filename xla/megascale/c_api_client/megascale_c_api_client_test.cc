@@ -30,10 +30,15 @@ using ::testing::UnorderedElementsAre;
 using ::xla::GetXlaPjrtTpuClient;
 using ::xla::megascale::c_api_client::CreateAoTMegascaleConfig;
 using ::xla::megascale::c_api_client::CreateDefaultMegaScaleClientContext;
+using ::xla::megascale::c_api_client::CreateMegascaleErrorAggregator;
 using ::xla::megascale::c_api_client::CreateMultiSliceMegascaleConfig;
+using ::xla::megascale::c_api_client::GetInterfaceAddressesHelper;
 using ::xla::megascale::c_api_client::MegaScaleClientContextFromClient;
+using ::xla::megascale::c_api_client::RegisterMegascaleErrorHandler;
+using ::xla::megascale::c_api_client::UnregisterMegascaleErrorHandler;
 using ::xla::megascale::runtime::DCNTopology;
 using ::xla::megascale::runtime::EndpointAddresses;
+using ::xla::megascale::runtime::MegaScaleRuntimeErrorOverlay;
 
 TEST(MegaScaleCApiClientTest, CreateDefaultMegaScaleClientContext) {
   TF_ASSERT_OK_AND_ASSIGN(auto client_context,
@@ -74,6 +79,34 @@ TEST(MegaScaleCApiClientTest, CreateMultiSliceMegascaleConfig) {
   EXPECT_EQ(config->SliceId(), 0);
   EXPECT_THAT(config->NumDevicesPerSlice(), UnorderedElementsAre(Pair(0, 2)));
   EXPECT_GT(config->Serialize().size(), 0);
+}
+
+TEST(MegaScaleCApiClientTest, CreateMegascaleErrorAggregator) {
+  TF_ASSERT_OK_AND_ASSIGN(auto aggregator,
+                          CreateMegascaleErrorAggregator("test_app"));
+  EXPECT_NE(aggregator, nullptr);
+  MegaScaleRuntimeErrorOverlay error;
+  aggregator->AddError("worker1", error);
+  EXPECT_EQ(aggregator->size(), 1);
+  EXPECT_TRUE(aggregator->active());
+  auto digest = aggregator->ProcessAndShutdown();
+  aggregator->LogErrorDigest(digest);
+  EXPECT_FALSE(aggregator->active());
+}
+
+TEST(MegaScaleCApiClientTest, RegisterAndUnregisterMegascaleErrorHandler) {
+  auto handler = [](const MegaScaleRuntimeErrorOverlay& error) {};
+  EXPECT_OK(RegisterMegascaleErrorHandler("test_handler", handler));
+  EXPECT_OK(UnregisterMegascaleErrorHandler("test_handler"));
+}
+
+TEST(MegaScaleCApiClientTest, GetInterfaceAddressesHelper) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto addresses,
+      GetInterfaceAddressesHelper("test_port", -1, {}, true, false));
+  // The exact addresses returned depend on the environment,
+  // but we can assert the C API plumbing works successfully.
+  EXPECT_GE(addresses.size(), 0);
 }
 
 }  // namespace

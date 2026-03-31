@@ -16,11 +16,14 @@ limitations under the License.
 #include "xla/backends/gpu/transforms/onehot_rewriter.h"
 
 #include <cstdint>
+#include <limits>
 #include <numeric>
 #include <optional>
 #include <vector>
 
+#include "absl/algorithm/container.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
@@ -44,39 +47,73 @@ namespace {
 
 namespace m = xla::match;
 
-HloInstruction* TraceOneHotPattern(HloInstruction* inst,
-                                   std::optional<int64_t> check_iota_dim) {
+HloInstruction* TraceIota(HloInstruction* inst, int64_t expected_dim) {
   HloInstruction* current = inst;
-  std::optional<int64_t> current_dim = check_iota_dim;
+  int64_t current_dim = expected_dim;
   constexpr int64_t kMaxTraceDepth = 20;
 
   for (int64_t depth = 0; depth < kMaxTraceDepth; ++depth) {
-    if (check_iota_dim.has_value() && current->opcode() == HloOpcode::kIota) {
-      return (Cast<HloIotaInstruction>(current)->iota_dimension() ==
-              *current_dim)
-                 ? current
-                 : nullptr;
+    if (current->opcode() == HloOpcode::kIota) {
+      if (current->shape().element_type() != S32) {
+        // TODO: b/477516620 - Support other index types.
+        VLOG(4) << "TraceIota: Iota element type mismatch on "
+                << current->name() << ". Expected S32, got "
+                << current->shape().element_type();
+        return nullptr;
+      }
+      if (Cast<HloIotaInstruction>(current)->iota_dimension() == current_dim) {
+        return current;
+      }
+      VLOG(4) << "TraceIota: Iota dimension mismatch on " << current->name()
+              << ". Expected " << current_dim << ", got "
+              << Cast<HloIotaInstruction>(current)->iota_dimension();
+      return nullptr;
     }
 
     HloInstruction* next = nullptr;
     if (Match(current, m::AnyOf<HloInstruction>(m::Broadcast(m::Op(&next)),
-                                                m::Reshape(m::Op(&next)),
-                                                m::Convert(m::Op(&next)),
-                                                m::Bitcast(m::Op(&next))))) {
-      if (check_iota_dim.has_value()) {
-        auto next_dim = current->MapUnaryOutputDimToOperandDim(*current_dim);
-        if (!next_dim.has_value()) {
-          return nullptr;
-        }
-        current_dim = next_dim;
+                                                m::Reshape(m::Op(&next))))) {
+      auto next_dim = current->MapUnaryOutputDimToOperandDim(current_dim);
+      if (!next_dim.has_value()) {
+        VLOG(4) << "TraceIota: MapUnaryOutputDimToOperandDim failed for "
+                << current->name() << " dim " << current_dim;
+        return nullptr;
       }
+      current_dim = *next_dim;
       current = next;
       continue;
     }
 
-    return check_iota_dim.has_value() ? nullptr : current;
+    return nullptr;
   }
+  VLOG(4) << "TraceIota: Max trace depth reached.";
   return nullptr;
+}
+
+// Traces Indices back through Broadcast.
+HloInstruction* TraceIndices(HloInstruction* inst, int64_t contract_dim) {
+  HloInstruction* current = inst;
+  HloInstruction* next = nullptr;
+  if (Match(current, m::Broadcast(m::Op(&next)))) {
+    // Broadcast must not permute dimensions.
+    if (!absl::c_is_sorted(current->dimensions())) {
+      return nullptr;
+    }
+    // Check if the broadcast only adds the contracting dimension.
+    bool adds_only_contract_dim = true;
+    for (int64_t i = 0; i < current->shape().dimensions().size(); ++i) {
+      if (i != contract_dim) {
+        if (!current->MapUnaryOutputDimToOperandDim(i).has_value()) {
+          adds_only_contract_dim = false;
+          break;
+        }
+      }
+    }
+    if (adds_only_contract_dim) {
+      return next;
+    }
+  }
+  return current;
 }
 
 struct OneHotMatch {
@@ -84,6 +121,31 @@ struct OneHotMatch {
   HloInstruction* weights;
   bool lhs_is_one_hot;
 };
+
+bool ShouldRewrite(const HloDotInstruction* dot, const OneHotMatch& match) {
+  int64_t weights_contract_dim =
+      (match.lhs_is_one_hot)
+          ? dot->dot_dimension_numbers().rhs_contracting_dimensions(0)
+          : dot->dot_dimension_numbers().lhs_contracting_dimensions(0);
+  int64_t depth = match.weights->shape().dimensions(weights_contract_dim);
+
+  if (depth == 0 || depth > std::numeric_limits<int32_t>::max()) {
+    return false;
+  }
+
+  // No rewrite at low depth/high batch, where dot is likely more efficient.
+  // Please see go/onehot-microbenchmark to re-evaluate this threshold.
+  // Note that the current threshold is defensive (too strict on some hardware),
+  // to avoid a complex heuristic.
+  int64_t batch = ShapeUtil::ElementsIn(match.indices->shape());
+  if (depth < 256 && batch > 1024) {
+    VLOG(3) << "Skipping OneHot rewrite for " << dot->name()
+            << " due to low depth/high batch ratio. depth: " << depth
+            << ", batch: " << batch;
+    return false;
+  }
+  return true;
+}
 
 // Returns a match if the dot instruction is a One-Hot encoded matmul.
 // 1. Identifies a Dot instruction.
@@ -103,6 +165,8 @@ std::optional<OneHotMatch> TryMatchOneHotDot(HloInstruction* instr) {
   if (dnums.lhs_batch_dimensions_size() > 0 ||
       dnums.rhs_batch_dimensions_size() > 0 ||
       dnums.lhs_contracting_dimensions_size() != 1) {
+    VLOG(3) << "Dot instruction " << dot->name()
+            << " failed dimension check for OneHot match.";
     return std::nullopt;
   }
 
@@ -127,6 +191,8 @@ std::optional<OneHotMatch> TryMatchOneHotDot(HloInstruction* instr) {
 
     if (!compare ||
         compare->comparison_direction() != ComparisonDirection::kEq) {
+      VLOG(3) << "Operand " << i << " of " << dot->name()
+              << " is not a valid comparison for OneHot.";
       continue;
     }
 
@@ -134,14 +200,17 @@ std::optional<OneHotMatch> TryMatchOneHotDot(HloInstruction* instr) {
     HloInstruction* cmp_lhs = compare->mutable_operand(0);
     HloInstruction* cmp_rhs = compare->mutable_operand(1);
 
-    bool lhs_iota = TraceOneHotPattern(cmp_lhs, contract_dim) != nullptr;
-    bool rhs_iota = TraceOneHotPattern(cmp_rhs, contract_dim) != nullptr;
+    bool lhs_iota = TraceIota(cmp_lhs, contract_dim) != nullptr;
+    bool rhs_iota = TraceIota(cmp_rhs, contract_dim) != nullptr;
 
     HloInstruction* found_indices = nullptr;
     if (lhs_iota && !rhs_iota) {
-      found_indices = TraceOneHotPattern(cmp_rhs, std::nullopt);
+      found_indices = TraceIndices(cmp_rhs, contract_dim);
     } else if (rhs_iota && !lhs_iota) {
-      found_indices = TraceOneHotPattern(cmp_lhs, std::nullopt);
+      found_indices = TraceIndices(cmp_lhs, contract_dim);
+    } else {
+      VLOG(3) << "Tracing failed for operand " << i << " of " << dot->name();
+      continue;
     }
 
     if (found_indices) {
@@ -151,9 +220,18 @@ std::optional<OneHotMatch> TryMatchOneHotDot(HloInstruction* instr) {
       if (found_indices->shape().dimensions().size() +
               weights->shape().dimensions().size() - 1 !=
           dot->shape().dimensions().size()) {
+        VLOG(3) << "Shape mismatch for OneHot match on " << dot->name();
         continue;
       }
-      return OneHotMatch{found_indices, weights, i == 0};
+      if (dot->shape().element_type() != weights->shape().element_type()) {
+        VLOG(3) << "Type mismatch for OneHot match on " << dot->name();
+        continue;
+      }
+      VLOG(2) << "Matched OneHot pattern on " << dot->name();
+      OneHotMatch match{found_indices, weights, i == 0};
+      if (ShouldRewrite(dot, match)) {
+        return match;
+      }
     }
   }
   return std::nullopt;
@@ -166,20 +244,15 @@ std::optional<OneHotMatch> TryMatchOneHotDot(HloInstruction* instr) {
 // In the original graph, out-of-bounds indices result in a zero one-hot vector
 // (as the equality check fails everywhere) and thus a zero result.
 //
-// Steps:
-// 1. Clamps the Indices to the valid range [0, depth-1] to prevent
-//    out-of-bounds memory access during Gather.
-// 2. Reshapes the Indices tensor to add a trailing dimension of size 1, as
-//    required by Gather.
-// 3. Configures a Gather instruction to slice the Weights tensor along the
-//    contracting dimension using the clamped Indices.
-// 4. Creates an "in-bounds" mask: (indices >= 0) && (indices < depth).
-// 5. Broadcasts the mask to the output shape.
-// 6. Selects between the Gather result and Zeros based on the mask, ensuring
-//    correctness (zeros) for invalid indices.
+// To preserve this behavior:
+// 1. Clamp the indices to the valid range [0, depth-1] to ensure the Gather
+//    instruction does not access invalid memory.
+// 2. Compute an "in-bounds" mask (0 <= indices < depth).
+// 3. Select between the Gather result and zeros based on the mask.
 absl::Status RewriteOneHotDotToGather(HloComputation* computation,
                                       HloDotInstruction* dot,
                                       const OneHotMatch& match) {
+  VLOG(2) << "Rewriting OneHot Dot " << dot->name() << " to Gather.";
   HloInstruction* indices = match.indices;
   HloInstruction* weights = match.weights;
   const Shape& dot_shape = dot->shape();
@@ -199,10 +272,16 @@ absl::Status RewriteOneHotDotToGather(HloComputation* computation,
       computation->AddInstruction(HloInstruction::CreateConstant(
           LiteralUtil::CreateR0<int32_t>(depth - 1)));
 
+  HloInstruction* zero_s32_broadcast = computation->AddInstruction(
+      HloInstruction::CreateBroadcast(indices->shape(), zero_s32, {}));
+  HloInstruction* depth_minus_one_broadcast = computation->AddInstruction(
+      HloInstruction::CreateBroadcast(indices->shape(), depth_minus_one, {}));
+
   // Clamp indices to valid memory range [0, depth-1].
-  HloInstruction* clamped_indices = computation->AddInstruction(
-      HloInstruction::CreateTernary(indices->shape(), HloOpcode::kClamp,
-                                    zero_s32, indices, depth_minus_one));
+  HloInstruction* clamped_indices =
+      computation->AddInstruction(HloInstruction::CreateTernary(
+          indices->shape(), HloOpcode::kClamp, zero_s32_broadcast, indices,
+          depth_minus_one_broadcast));
 
   // Create Gather
   Shape indices_shape = indices->shape();
@@ -244,8 +323,6 @@ absl::Status RewriteOneHotDotToGather(HloComputation* computation,
 
   // Create in-bounds mask: (indices >= 0) && (indices < depth).
   Shape mask_shape = ShapeUtil::ChangeElementType(indices->shape(), PRED);
-  HloInstruction* zero_s32_broadcast = computation->AddInstruction(
-      HloInstruction::CreateBroadcast(indices->shape(), zero_s32, {}));
   HloInstruction* depth_s32_broadcast = computation->AddInstruction(
       HloInstruction::CreateBroadcast(indices->shape(), depth_s32, {}));
 
@@ -261,7 +338,7 @@ absl::Status RewriteOneHotDotToGather(HloComputation* computation,
 
   // Broadcast mask to match the Dot output shape.
   // The Indices dimensions are either at the start or end of the output.
-  std::vector<int64_t> broadcast_dims(indices->shape().dimensions_size());
+  std::vector<int64_t> broadcast_dims(indices->shape().dimensions().size());
   int start_dim = match.lhs_is_one_hot ? 0 : weights_nc_rank;
   std::iota(broadcast_dims.begin(), broadcast_dims.end(), start_dim);
 
@@ -291,6 +368,17 @@ absl::Status RewriteOneHotDotToGather(HloComputation* computation,
 absl::StatusOr<bool> OneHotGatherRewriter::RunImpl(
     HloModule* module,
     const absl::flat_hash_set<absl::string_view>& execution_threads) {
+  // This rewrite propagates 0 instead of NaNs in some cases (see
+  // b/477516620#comment12 for details), so it is only enabled with
+  // --xla_gpu_experimental_enable_onehot_rewriter.
+  if (!module->config()
+           .debug_options()
+           .xla_gpu_experimental_enable_onehot_rewriter()) {
+    VLOG(2) << "Skipping OneHot rewrite due to "
+               "--xla_gpu_experimental_enable_onehot_rewriter=false.";
+    return false;
+  }
+
   bool changed = false;
 
   for (HloComputation* computation :

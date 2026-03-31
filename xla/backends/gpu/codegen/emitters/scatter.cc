@@ -55,6 +55,7 @@ limitations under the License.
 #include "xla/codegen/emitters/utils.h"
 #include "xla/hlo/analysis/indexing_analysis.h"
 #include "xla/hlo/analysis/indexing_map.h"
+#include "xla/hlo/analysis/symbolic_map.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
@@ -102,6 +103,7 @@ using mlir::func::FuncOp;
 using mlir::func::ReturnOp;
 using primitive_util::IsUnsignedIntegralType;
 
+constexpr int64_t kGpuGridDims = 6;
 constexpr int64_t kNumWarpsPerBlock = 4;
 constexpr int64_t kMaxVectorizedBits = 128;
 constexpr int64_t kScatterOperandIndex = 0;
@@ -204,14 +206,12 @@ SmallVector<ValueRange> Unpack(ValueRange range, ArrayRef<int64_t> sizes) {
 
 // Pads the given values with zeros to the given container size.
 SmallVector<Value, 4> PadWithZeros(ValueRange values, int64_t size,
+                                   absl::Span<const int64_t> mapping,
                                    ImplicitLocOpBuilder& b) {
-  SmallVector<Value, 4> padded_values(values.begin(), values.end());
-  if (values.size() >= size) {
-    return padded_values;
-  }
   auto zero = arith::ConstantIndexOp::create(b, 0);
-  for (int i = values.size(); i < size; ++i) {
-    padded_values.push_back(zero);
+  SmallVector<Value, 4> padded_values(size, zero);
+  for (const auto& [value, map_dim] : llvm::zip(values, mapping)) {
+    padded_values[map_dim] = value;
   }
   return padded_values;
 }
@@ -431,10 +431,9 @@ void ScatterWithDistributedUpdates::ComputeIndexing(
   if (indices_map) {
     // Create a map from scatter update to scatter indices.
     *indices_map = IndexingMap{
-        AffineMap::get(6, 1,
-                       {scatter_update_map.GetAffineMap().getResult(0),
-                        getAffineSymbolExpr(0, mlir_context)},
-                       mlir_context),
+        SymbolicMap::Get(mlir_context, kGpuGridDims, /*num_symbols=*/1,
+                         {scatter_update_map.GetSymbolicMap().GetResult(0),
+                          CreateSymbolExpr(0, kGpuGridDims, mlir_context)}),
         DimVarsFromGPUGrid({num_warps_ * warp_size_, 1, 1, num_blocks_, 1, 1}),
         RangeVarsFromTensorSizes({description_.index_vector_length}),
         /*rt_vars=*/{}};
@@ -476,10 +475,13 @@ void EmitNaiveImplementation(ImplicitLocOpBuilder& b,
                              const IndexingMap& indices_map,
                              ValueRange thread_and_block_ids,
                              Value output_tensor) {
+  auto scatter_indices_to_operand_dim =
+      description.scatter->scatter_dimension_numbers()
+          .scatter_dims_to_operand_dims();
   MLIRContext* mlir_context = b.getContext();
   auto thread_id_to_update_id_map = IndexingMap(
-      AffineMap::get(6, 0, {updates_map.GetAffineMap().getResult(0)},
-                     mlir_context),
+      SymbolicMap::Get(mlir_context, kGpuGridDims, /*num_symbols=*/0,
+                       {updates_map.GetSymbolicMap().GetResult(0)}),
       updates_map.GetDimVars(),
       /*range_vars = */ {}, /*rt vars = */ {});
   Value thread_id_to_index_id_value =
@@ -494,6 +496,10 @@ void EmitNaiveImplementation(ImplicitLocOpBuilder& b,
       [&](ImplicitLocOpBuilder& outer_nested_b) -> SmallVector<Value> {
         SmallVector<Value, 4> update_offsets =
             helper.ExtractOffsets(outer_nested_b, thread_id_to_index_id_value);
+        int64_t output_rank = description.output_shape.size();
+        update_offsets =
+            PadWithZeros(update_offsets, output_rank,
+                         scatter_indices_to_operand_dim, outer_nested_b);
 
         Value in_bounds =
             EmitBoundsCheck(outer_nested_b, description.slice_shape,
@@ -511,9 +517,6 @@ void EmitNaiveImplementation(ImplicitLocOpBuilder& b,
                     auto update_elem =
                         helper.GetUpdateElement(update_loop_b, map_results);
                     auto output_indices = std::move(update_offsets);
-                    int64_t output_rank = description.output_shape.size();
-                    output_indices = PadWithZeros(output_indices, output_rank,
-                                                  update_loop_b);
                     for (int i = 0; i < output_indices.size(); ++i) {
                       output_indices[i] = arith::AddIOp::create(
                           update_loop_b, map_results[i + 1], output_indices[i]);
@@ -673,13 +676,13 @@ absl::Status ScatterWithDistributedIndices::EmitEntryFunctionImpl(
   MLIRContext* mlir_context = b.getContext();
 
   auto thread_id_to_update_id_map = IndexingMap(
-      AffineMap::get(6, 2, {indices_map.GetAffineMap().getResult(0)},
-                     mlir_context),
+      SymbolicMap::Get(mlir_context, kGpuGridDims, /*num_symbols=*/2,
+                       {indices_map.GetSymbolicMap().GetResult(0)}),
       indices_map.GetDimVars(),
       /*range_vars = */
       {indices_map.GetRangeVars().begin(),
        indices_map.GetRangeVars().begin() + 2},
-      /*rt vars = */ {}, indices_map.GetConstraints());
+      /*rt vars = */ {}, indices_map.GetSymbolicConstraints());
 
   // Convert index_id_loop and index_vector_id to dimension variables.
   IndexingMap slice_indexing =
@@ -698,6 +701,9 @@ absl::Status ScatterWithDistributedIndices::EmitEntryFunctionImpl(
 
   int64_t output_rank = description_.output_shape.size();
 
+  auto scatter_indices_to_operand_dims =
+      description_.scatter->scatter_dimension_numbers()
+          .scatter_dims_to_operand_dims();
   auto loop_over_indices_fn =
       [&](ImplicitLocOpBuilder& nested_b, ValueRange ivs,
           ValueRange thread_id_to_index_id_value,
@@ -720,7 +726,8 @@ absl::Status ScatterWithDistributedIndices::EmitEntryFunctionImpl(
         index_vector_id);
 
     SmallVector<Value> offsets =
-        PadWithZeros(trimmed_offsets, output_rank, nested_b);
+        PadWithZeros(trimmed_offsets, output_rank,
+                     scatter_indices_to_operand_dims, nested_b);
 
     auto new_trimmed_offsets =
         helper.ExtractOffsets(nested_b, thread_id_to_index_id_value.front());
@@ -735,7 +742,8 @@ absl::Status ScatterWithDistributedIndices::EmitEntryFunctionImpl(
                                   new_trimmed_offsets[i], trimmed_offsets[i]);
     }
 
-    auto new_offsets = PadWithZeros(new_trimmed_offsets, output_rank, nested_b);
+    auto new_offsets = PadWithZeros(new_trimmed_offsets, output_rank,
+                                    scatter_indices_to_operand_dims, nested_b);
 
     // Write accumulated values into the tensor if the offsets changed.
     Value is_not_first_iteration =
@@ -825,7 +833,8 @@ absl::Status ScatterWithDistributedIndices::EmitEntryFunctionImpl(
              {1, description_.index_vector_length, 1, 1, 1});
   Value result_slice_id = loop_over_indices_results_unpacked[0].front();
   auto result_offsets =
-      PadWithZeros(loop_over_indices_results_unpacked[1], output_rank, b);
+      PadWithZeros(loop_over_indices_results_unpacked[1], output_rank,
+                   scatter_indices_to_operand_dims, b);
   Value result_is_inbounds = loop_over_indices_results_unpacked[2].front();
   Value result_acc = loop_over_indices_results_unpacked[3].front();
   Value result_output = loop_over_indices_results_unpacked[4].front();

@@ -55,7 +55,6 @@ limitations under the License.
 #include "xla/future.h"
 #include "xla/layout.h"
 #include "xla/layout_util.h"
-#include "xla/maybe_owning.h"
 #include "xla/pjrt/async_work_runner.h"
 #include "xla/pjrt/distributed/key_value_store_interface.h"
 #include "xla/pjrt/distributed/protocol.pb.h"
@@ -101,11 +100,16 @@ limitations under the License.
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/logging.h"
 #include "xla/tsl/platform/statusor.h"
+#include "xla/tsl/util/maybe_owning.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
 #include "tsl/platform/casts.h"
 #include "tsl/platform/fingerprint.h"
 #include "tsl/profiler/lib/traceme.h"
+
+#if GOOGLE_CUDA
+#include "xla/stream_executor/cuda/cuda_device_address_vmm_allocator.h"
+#endif  // GOOGLE_CUDA
 
 #if defined(PLATFORM_WINDOWS)
 // Required to build successfully with Mingw
@@ -548,9 +552,9 @@ std::vector<PjRtDevice*> InitializeDevices(
   return devices;
 }
 
-absl::flat_hash_map<PjRtGlobalDeviceId, TfrtGpuDevice*> GetIdToDeviceMap(
+absl::flat_hash_map<GlobalDeviceId, TfrtGpuDevice*> GetIdToDeviceMap(
     absl::Span<const std::unique_ptr<TfrtGpuDevice>> devices) {
-  absl::flat_hash_map<PjRtGlobalDeviceId, TfrtGpuDevice*> id_to_device;
+  absl::flat_hash_map<GlobalDeviceId, TfrtGpuDevice*> id_to_device;
   for (const std::unique_ptr<TfrtGpuDevice>& device : devices) {
     CHECK(id_to_device.emplace(device->global_device_id(), device.get()).second)
         << "Duplicate device id: " << device->id();
@@ -637,6 +641,9 @@ absl::StatusOr<std::unique_ptr<tsl::Allocator>> CreateAllocatorForDevice(
     case GpuAllocatorConfig::Kind::kPlatform:
       LOG(FATAL) << "Platform allocator should be handled before calling this "
                     "function.";
+    case GpuAllocatorConfig::Kind::kVmm:
+      LOG(FATAL) << "VMM allocator should be handled before calling this "
+                    "function.";
   }
 }
 
@@ -652,6 +659,29 @@ absl::StatusOr<MaybeOwning<se::DeviceAddressAllocator>> CreateDeviceAllocator(
     }
     return MaybeOwning<se::DeviceAddressAllocator>(
         xla_client->backend().memory_allocator());
+  }
+
+  if (allocator_config.kind == GpuAllocatorConfig::Kind::kVmm) {
+#if GOOGLE_CUDA
+    std::vector<std::pair<se::StreamExecutor*, se::Stream*>> executor_streams;
+    for (const auto& device : devices) {
+      se::StreamExecutor* executor = device->executor();
+      if (executor == nullptr) {
+        // Skips remote devices.
+        continue;
+      }
+      executor_streams.push_back({executor, device->stream()});
+    }
+    TF_ASSIGN_OR_RETURN(
+        auto vmm_alloc,
+        se::gpu::CudaDeviceAddressVmmAllocator::Create(
+            xla_client->platform(), allocator_config.memory_fraction,
+            allocator_config.gpu_system_memory_size, executor_streams));
+    return MaybeOwning<se::DeviceAddressAllocator>(std::move(vmm_alloc));
+#else
+    return absl::UnimplementedError(
+        "VMM allocator is only supported with CUDA.");
+#endif  // GOOGLE_CUDA
   }
 
   std::vector<se::MultiDeviceAdapter::AllocatorInfo> allocators;
@@ -966,15 +996,25 @@ absl::Status BlockHostUntilDoneWithHostCallback(se::Stream* stream) {
   absl::Notification event;
 
   tsl::profiler::TraceMe traceme("BlockHostUntilDoneWithHostCallback");
-  auto status = stream->DoHostCallback([&event]() {
-    tsl::profiler::TraceMe traceme(
-        "BlockHostUntilDoneWithHostCallback::Callback");
-    event.Notify();
-  });
+  absl::Status result = absl::OkStatus();
+  TF_RETURN_IF_ERROR(stream->DoHostCallback(
+      [&event, &result]() {
+        tsl::profiler::TraceMe traceme(
+            "BlockHostUntilDoneWithHostCallback::Callback");
+        result = absl::OkStatus();
+        event.Notify();
+      },
+      /*error_cb=*/
+      [&event, &result](absl::Status status) {
+        tsl::profiler::TraceMe traceme(
+            "BlockHostUntilDoneWithHostCallback::ErrorCallback");
+        result = status;
+        event.Notify();
+      }));
 
   event.WaitForNotification();
 
-  return status;
+  return result;
 }
 
 }  // namespace xla

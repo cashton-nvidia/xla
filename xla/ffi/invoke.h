@@ -45,6 +45,10 @@ namespace Eigen {
 struct ThreadPoolDevice;
 }  // namespace Eigen
 
+namespace xla::cpu {
+class TargetMachineOptions;
+}  // namespace xla::cpu
+
 namespace stream_executor {
 class Stream;
 class DeviceAddressAllocator;
@@ -82,29 +86,40 @@ struct InvokeContext {
     const gpu::CollectiveCliques* collective_cliques = nullptr;
     const gpu::CollectiveMemory* collective_memory = nullptr;
     const stream_executor::GpuComputeCapability* compute_capability = nullptr;
+    const xla::cpu::TargetMachineOptions* cpu_target_machine_options = nullptr;
   };
 
   using BackendContext = std::variant<std::monostate, CpuContext, GpuContext>;
 
-  RunId run_id = RunId{-1};
+  // Execution state for instantiate, prepare and initialize. See execution
+  // state documentation for different kinds of execution state that FFI
+  // handlers support (per-instance and per-execution).
+  struct StateContext {
+    ExecutionState* instantiate = nullptr;
+    ExecutionState* prepare = nullptr;
+    ExecutionState* initialize = nullptr;
+  };
+
+  RunId run_id = RunId{0};
   int32_t device_ordinal = -1;
+
   BackendContext backend_context;
+  StateContext state_context;
 
   const HloComputation* called_computation = nullptr;
   const ExecutionContext* execution_context = nullptr;
-  ExecutionState* execution_state = nullptr;
 };
 
 // Invokes an XLA FFI handler with the given call frame and context. This is a
 // synchronous call and it might block the caller thread if the handler is
 // asynchronous. It is unsafe to call if from a thread pool that runs tasks
 // scheduled by the handler itself.
-absl::Status Invoke(Ffi& handler, CallFrame& call_frame,
+absl::Status Invoke(const XLA_FFI_Api* api, Ffi& handler, CallFrame& call_frame,
                     const InvokeContext& context = {},
                     ExecutionStage stage = ExecutionStage::kExecute);
 
 absl::Status Invoke(
-    XLA_FFI_Handler* handler, CallFrame& call_frame,
+    const XLA_FFI_Api* api, XLA_FFI_Handler* handler, CallFrame& call_frame,
     const InvokeContext& context = {},
     XLA_FFI_ExecutionStage stage = XLA_FFI_ExecutionStage_EXECUTE);
 
@@ -112,17 +127,20 @@ absl::Status Invoke(
 // asynchronous call and it will not block the caller thread. Returned async
 // value will become available when the handler completes execution.
 tsl::AsyncValueRef<tsl::Chain> InvokeAsync(
-    Ffi& handler, CallFrame& call_frame, const InvokeContext& context = {},
+    const XLA_FFI_Api* api, Ffi& handler, CallFrame& call_frame,
+    const InvokeContext& context = {},
     ExecutionStage stage = ExecutionStage::kExecute);
 
 tsl::AsyncValueRef<tsl::Chain> InvokeAsync(
-    XLA_FFI_Handler* handler, CallFrame& call_frame,
+    const XLA_FFI_Api* api, XLA_FFI_Handler* handler, CallFrame& call_frame,
     const InvokeContext& context = {},
     XLA_FFI_ExecutionStage stage = XLA_FFI_ExecutionStage_EXECUTE);
 
 // Gets metadata from the handler by invoking it with a special call frame.
-absl::StatusOr<XLA_FFI_Metadata> GetMetadata(Ffi& handler);
-absl::StatusOr<XLA_FFI_Metadata> GetMetadata(XLA_FFI_Handler* handler);
+absl::StatusOr<XLA_FFI_Metadata> GetMetadata(const XLA_FFI_Api* api,
+                                             Ffi& handler);
+absl::StatusOr<XLA_FFI_Metadata> GetMetadata(const XLA_FFI_Api* api,
+                                             XLA_FFI_Handler* handler);
 
 //===----------------------------------------------------------------------===//
 // ScopedExecutionContext for tests and internal users.

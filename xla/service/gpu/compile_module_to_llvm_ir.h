@@ -47,7 +47,7 @@ namespace xla {
 namespace gpu {
 
 struct CompileModuleResults {
-  std::unique_ptr<llvm::Module> llvm_module;
+  std::vector<std::unique_ptr<llvm::Module>> llvm_modules;
   std::unique_ptr<llvm::Module> llvm_module_constants;
   std::unique_ptr<BufferAssignment> buffer_assignment;
   std::unique_ptr<ExecutionStreamAssignment> execution_stream_assignment;
@@ -75,7 +75,13 @@ absl::StatusOr<CompileModuleResults> CompileModuleToLlvmIr(
     const GpuAliasInfo* alias_info,
     BufferValue::SizeFunction buffer_size_bytes_function,
     llvm_ir::LLVMCommandLineOptionsReleasableLock& llvm_options_lock,
-    bool split_constants_module = false);
+    const xla::cpu::TargetMachineOptions* cpu_target_machine_options = nullptr);
+
+void LinkLlvmModulesInPlace(
+    std::vector<std::unique_ptr<llvm::Module>>& llvm_modules);
+
+std::unique_ptr<llvm::Module> CopyToContext(const llvm::Module& module,
+                                            llvm::LLVMContext& context);
 
 }  // namespace gpu
 }  // namespace xla

@@ -17,7 +17,6 @@ limitations under the License.
 #include <string>
 
 #include <gtest/gtest.h>
-#include "absl/strings/match.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "xla/client/client_library.h"
@@ -27,6 +26,7 @@ limitations under the License.
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/literal.h"
 #include "xla/literal_util.h"
+#include "xla/pjrt/proto/compile_options.pb.h"
 #include "xla/service/gpu/backend_configs.pb.h"
 #include "xla/service/platform_util.h"
 #include "xla/service/shaped_buffer.h"
@@ -49,6 +49,9 @@ TEST_P(XlaAotCompileTest, LoadGpuExecutable) {
   std::string serialized_aot_result;
   TF_ASSERT_OK(
       tsl::ReadFileToString(tsl::Env::Default(), path, &serialized_aot_result));
+  ExecutableAndOptionsProto proto;
+  ASSERT_TRUE(proto.ParseFromString(serialized_aot_result));
+  serialized_aot_result = proto.serialized_executable();
 
   // Get a LocalClient
   TF_ASSERT_OK_AND_ASSIGN(se::Platform * platform,
@@ -100,6 +103,9 @@ TEST(XlaCompileTest, LoadGpuExecutableWithConstant) {
   std::string serialized_aot_result;
   TF_ASSERT_OK(
       tsl::ReadFileToString(tsl::Env::Default(), path, &serialized_aot_result));
+  ExecutableAndOptionsProto proto;
+  ASSERT_TRUE(proto.ParseFromString(serialized_aot_result));
+  serialized_aot_result = proto.serialized_executable();
 
   // Get a LocalClient
   TF_ASSERT_OK_AND_ASSIGN(se::Platform * platform,
@@ -143,6 +149,9 @@ TEST(XlaCompileTest, LoadGpuExecutableWithConvolution) {
   std::string serialized_aot_result;
   TF_ASSERT_OK(
       tsl::ReadFileToString(tsl::Env::Default(), path, &serialized_aot_result));
+  ExecutableAndOptionsProto proto;
+  ASSERT_TRUE(proto.ParseFromString(serialized_aot_result));
+  serialized_aot_result = proto.serialized_executable();
 
   // Get a LocalClient
   TF_ASSERT_OK_AND_ASSIGN(se::Platform * platform,
