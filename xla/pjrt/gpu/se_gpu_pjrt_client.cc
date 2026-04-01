@@ -28,6 +28,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/algorithm/container.h"
+#include "absl/base/no_destructor.h"
 #include "absl/container/btree_map.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
@@ -44,6 +45,7 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
+#include "xla/backends/cpu/target_machine_options.h"
 #include "xla/backends/gpu/collectives/gpu_clique.h"
 #include "xla/backends/gpu/collectives/gpu_clique_key.h"
 #include "xla/backends/gpu/collectives/gpu_cliques.h"
@@ -90,7 +92,9 @@ limitations under the License.
 #include "xla/pjrt/tracked_device_buffer.h"
 #include "xla/pjrt/worker_thread.h"
 #include "xla/runtime/device_id.h"
+#include "xla/runtime/hang_watchdog.h"
 #include "xla/runtime/process_id.h"
+#include "xla/service/buffer_assignment.h"
 #include "xla/service/compiler.h"
 #include "xla/service/computation_placer.h"
 #include "xla/service/gpu/gpu_memory_space_assignment.h"
@@ -111,6 +115,7 @@ limitations under the License.
 #include "xla/tsl/concurrency/async_value_ref.h"
 #include "xla/tsl/concurrency/ref_count.h"
 #include "xla/tsl/framework/allocator.h"
+#include "xla/tsl/platform/env.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/tsl/platform/statusor.h"
 #include "xla/tsl/protobuf/coordination_service.pb.h"
@@ -204,6 +209,15 @@ static absl::flat_hash_map<std::string, PjRtDeviceAttribute> GetAttrsForDevices(
       attrs["target_config"] = std::move(attr);
     }
   }
+
+  std::string host_target_machine_options;
+  if (tsl::protobuf::TextFormat::PrintToString(
+          xla::cpu::TargetMachineOptions().ToProto(),
+          &host_target_machine_options)) {
+    attrs["host_target_machine_options"] =
+        std::move(host_target_machine_options);
+  }
+
   return attrs;
 }
 
@@ -492,6 +506,29 @@ class PreparedReceive {
   }
 };
 
+// Hang watchdog for GPU clique acquisition in the PjRt client. Clique
+// acquisition can block indefinitely inside ncclCommInit if remote nodes are
+// unreachable.
+static HangWatchdog& PjRtClientHangWatchdog() {
+  static absl::NoDestructor<HangWatchdog> watchdog(
+      tsl::Env::Default(), "pjrt-gpu-client", /*num_threads=*/2);
+  return *watchdog;
+}
+
+static absl::Duration PjRtClientWatchdogTimeout() {
+  const auto& debug_options = GetDebugOptionsFromFlags();
+  absl::Duration timeout = absl::InfiniteDuration();
+  if (!debug_options.xla_gpu_execution_terminate_timeout().empty()) {
+    if (!absl::ParseDuration(
+            debug_options.xla_gpu_execution_terminate_timeout(), &timeout)) {
+      LOG(WARNING) << "Failed to parse xla_gpu_execution_terminate_timeout: "
+                   << debug_options.xla_gpu_execution_terminate_timeout();
+      return absl::InfiniteDuration();
+    }
+  }
+  return timeout;
+}
+
 // Acquire the GPU clique and communicator for a given clique key.
 absl::StatusOr<AcquiredCliqueAndCommunicator> AcquireCliqueAndCommunicator(
     StreamExecutorGpuClient* client, gpu::GpuCollectives* gpu_collectives,
@@ -506,8 +543,23 @@ absl::StatusOr<AcquiredCliqueAndCommunicator> AcquireCliqueAndCommunicator(
   gpu::CliqueIdCallback clique_id_callback =
       dummy_gpu_run_options->clique_id_callback();
 
-  // Acquire the GPU clique for this receive.
+  // Acquire the GPU clique for this receive. Guard the acquisition with a hang
+  // watchdog because AcquireGpuClique can block indefinitely inside
+  // ncclCommInit waiting for remote nodes during NCCL communicator setup.
   if (!acquired_cliques_map.contains(clique_key)) {
+    int32_t device_ordinal = stream->parent()->device_ordinal();
+    absl::Duration watchdog_timeout = PjRtClientWatchdogTimeout();
+
+    std::shared_ptr<HangWatchdog::Guard> guard = nullptr;
+    if (watchdog_timeout < absl::InfiniteDuration()) {
+      std::string watchdog_name =
+          absl::StrFormat("[%d] PjRt GPU client AcquireGpuClique for %v",
+                          device_ordinal, clique_key);
+      guard = PjRtClientHangWatchdog().Watch(
+          watchdog_name, watchdog_timeout,
+          HangWatchdog::Abort(watchdog_name, watchdog_timeout));
+    }
+
     TF_ASSIGN_OR_RETURN(
         acquired_cliques_map[clique_key],
         AcquireGpuClique(gpu_collectives,
@@ -1659,7 +1711,14 @@ absl::StatusOr<DeviceTopologyPair> BuildDistributedDevices(
     LOG(INFO) << "Failed to get network nodes: " << network_nodes.status();
   }
 
+  std::optional<gpu::GpuTargetConfig> gpu_target_config;
+
   for (const auto& [ordinal, device] : local_device_states) {
+    // We expect all devices on a host to have the same target config, so we
+    // only need to get the target config for the first device.
+    if (!gpu_target_config.has_value()) {
+      gpu_target_config.emplace(device->executor());
+    }
     const se::Platform* platform = device->executor()->GetPlatform();
     TF_ASSIGN_OR_RETURN(
         std::unique_ptr<xla::se::DeviceDescription> desc,
@@ -1680,6 +1739,16 @@ absl::StatusOr<DeviceTopologyPair> BuildDistributedDevices(
       device_proto->set_fabric_uuid(
           absl::StrCat(info.cluster_uuid, "/", info.clique_id));
     }
+  }
+
+  if (!gpu_target_config.has_value()) {
+    // A PjRtClient without any devices makes no sense, but we need to support
+    // it for compatibility with Tensorflow. So we create an empty GPU target
+    // config.
+    stream_executor::GpuTargetConfigProto gpu_target_config_proto;
+    gpu_target_config_proto.set_platform_name(platform_name);
+    ASSIGN_OR_RETURN(gpu_target_config,
+                     gpu::GpuTargetConfig::FromProto(gpu_target_config_proto));
   }
 
   GlobalTopologyProto global_topology;
@@ -1819,16 +1888,19 @@ absl::StatusOr<DeviceTopologyPair> BuildDistributedDevices(
   }
 
   size_t num_processes = global_topology.processes().size();
-  TF_ASSIGN_OR_RETURN(
-      auto clique_id_callback,
-      gpu_collectives->InitializeTopology({ProcessId(process_id), num_processes,
-                                           local_device_states.size(), kv_store,
-                                           device_to_process}));
-  gpu_executable_run_options->set_clique_id_callback(
-      std::move(clique_id_callback));
+  if (gpu_collectives->IsImplemented()) {
+    TF_ASSIGN_OR_RETURN(
+        auto clique_id_callback,
+        gpu_collectives->InitializeTopology(
+            {ProcessId(process_id), num_processes, local_device_states.size(),
+             kv_store, device_to_process}));
+    gpu_executable_run_options->set_clique_id_callback(
+        std::move(clique_id_callback));
+  }
 
   TF_ASSIGN_OR_RETURN(GpuTopologyProto gpu_topology,
-                      BuildGpuTopology(global_topology));
+                      BuildGpuTopology(global_topology, *gpu_target_config,
+                                       cpu::TargetMachineOptions()));
   return std::make_pair(std::move(devices), gpu_topology);
 }
 
